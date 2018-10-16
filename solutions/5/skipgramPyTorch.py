@@ -135,15 +135,20 @@ def train(logger):
     SAVE_WEIGHTS_EACH = 1000
     WEIGHTS_PATH = "weights.pth"
     ALL_CODNUMS_PATH = "data/all_codnums.pickle"
+    LOAD_FROM_WEIGHTS = True
 
     all_codnums = read_all_codnums(ALL_CODNUMS_PATH)
 
     vocab_size = max(max(all_codnums))
     batch_gen = process_data(all_codnums, BATCH_SIZE, SKIP_WINDOW, vocab_size, NUM_NEG_SAMPLES)
 
-    losses = []
     model = SkipGram(vocab_size, EMBEDDING_DIM, BATCH_SIZE)
+    if LOAD_FROM_WEIGHTS:
+        model.load_state_dict(torch.load(WEIGHTS_PATH))
+
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+
+    losses = []
 
     print("starting to train...")
     for i_batch in range(BATCHES_TO_PROCESS):
