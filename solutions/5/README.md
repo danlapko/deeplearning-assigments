@@ -1,0 +1,1 @@
+precalculated all_codnums (unzip and put into 5/data) https://yadi.sk/d/OSVijWGbPysiFg
