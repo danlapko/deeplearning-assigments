@@ -9,7 +9,10 @@ import tensorflow as tf
 import pickle
 import os
 import random
+from io import BytesIO
 
+import scipy.misc
+import tensorflow as tf
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
@@ -17,6 +20,29 @@ torch.manual_seed(1)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print("device=", device)
+
+
+class Logger:
+    def __init__(self, log_dir):
+        self.writer = tf.summary.FileWriter(log_dir)
+
+    def scalar_summary(self, tag, value, step):
+        scalar_summaries = [tf.Summary.Value(tag=tag, simple_value=value)]
+        summary = tf.Summary(value=scalar_summaries)
+        self.writer.add_summary(summary, step)
+
+    def image_summary(self, tags, images, step):
+        img_summaries = []
+        for tag, img in zip(tags, images):
+            s = BytesIO()  # Write the image to a string
+            scipy.misc.toimage(img).save(s, format="png")
+            img_sum = tf.Summary.Image(encoded_image_string=s.getvalue(),
+                                       height=img.shape[0],
+                                       width=img.shape[1])
+            img_summaries.append(tf.Summary.Value(tag=f"{tag}", image=img_sum))
+
+        summary = tf.Summary(value=img_summaries)
+        self.writer.add_summary(summary, step)
 
 
 def sample_generator(all_codnums, context_window_size, vocab_size, num_neg_samples):
@@ -48,37 +74,11 @@ def batch_generator(sample_gen, batch_size):
         yield center_batch, target_batch, negative_batch
 
 
-def flatten(x):
-    return [item for sublist in x for item in sublist]
-
-
-def codnes_to_nums(cod, dictionary):
-    return [dictionary[key] for key in cod]
-
-
-def make_vocabulary_and_dictionary(all_codones):
-    flat_codones = flatten(all_codones)
-    vocab = set(flat_codones)
-    dictionary = {cod: i for i, cod in enumerate(vocab)}
-    return vocab, dictionary
-
-
 def process_data(all_codnums, batch_size, skip_window, vocab_size, num_neg_samples):
-    # but 3grams replaced by nums
+    # 3grams replaced by nums
     sample_gen = sample_generator(all_codnums, skip_window, vocab_size, num_neg_samples)
     batch_gen = batch_generator(sample_gen, batch_size=batch_size)
-    return batch_gen  # returns batch of center_3gram_num --> target_3gram_num (target is context)
-
-
-# all_codones = read_or_create(read_path='data/all_codones.pickle')
-# vocab, codone_to_ix = make_vocabulary_and_dictionary(all_codones)
-
-
-def save_all_codnums(batches, path):
-    print('saving', path)
-    with open(path, 'wb') as fp:
-        pickle.dump(batches, fp)
-    print("end of saving")
+    return batch_gen  # returns batches of center_3gram_num, target_3gram_num, 5 x negative_3gram_nums (num in terms ix in vocabulary)
 
 
 def read_all_codnums(read_path):
@@ -89,18 +89,17 @@ def read_all_codnums(read_path):
         return tmp
 
 
-class NGramLanguageModeler(nn.Module):
+class SkipGram(nn.Module):
 
-    def __init__(self, vocab_size, embedding_dim):
-        super(NGramLanguageModeler, self).__init__()
+    def __init__(self, vocab_size, embedding_dim, batch_size):
+        super(SkipGram, self).__init__()
+        self.batch_size = batch_size
+
         self.embed_center = nn.Embedding(vocab_size, embedding_dim).to(device)
         self.embed_context = nn.Embedding(vocab_size, embedding_dim).to(device)
 
         self.embed_center.weight.data.uniform_(-0.2, 0.2)
         self.embed_context.weight.data.uniform_(-0.2, 0.2)
-
-        # self.linear1 = nn.Linear(context_size * embedding_dim, 256).to(device)
-        # self.linear2 = nn.Linear(256, vocab_size).to(device)
 
     def forward(self, center, target, negative):
         center_vec = self.embed_center(center)
@@ -125,51 +124,58 @@ class NGramLanguageModeler(nn.Module):
         return loss
 
 
-def _main():
+def train(logger):
     BATCH_SIZE = 128
     SKIP_WINDOW = 12  # the context window
     learning_rate = 0.01
     EMBEDDING_DIM = 100
     NUM_NEG_SAMPLES = 5
+    BATCHES_TO_PROCESS = 100_000
+    PRINT_LOSS_EACH = 100
+    SAVE_WEIGHTS_EACH = 1000
+    WEIGHTS_PATH = "weights.pth"
+    ALL_CODNUMS_PATH = "data/all_codnums.pickle"
 
-    all_codnums = read_all_codnums("data/all_codnums.pickle")
+    all_codnums = read_all_codnums(ALL_CODNUMS_PATH)
 
     vocab_size = max(max(all_codnums))
     batch_gen = process_data(all_codnums, BATCH_SIZE, SKIP_WINDOW, vocab_size, NUM_NEG_SAMPLES)
 
     losses = []
-    model = NGramLanguageModeler(vocab_size, EMBEDDING_DIM)
+    model = SkipGram(vocab_size, EMBEDDING_DIM, BATCH_SIZE)
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
 
-    for epoch in range(10):
-        total_loss = 0
-        for i_batch, (center_batch, target_batch, negative_batch) in enumerate(batch_gen):
-            # Step 2. Recall that torch *accumulates* gradients. Before passing in a
-            # new instance, you need to zero out the gradients from the old
-            # instance
-            model.zero_grad()
+    print("starting to train...")
+    for i_batch in range(BATCHES_TO_PROCESS):
 
-            # Step 3. Run the forward pass, getting log probabilities over next
-            # words
-            # Step 4. Compute your loss function. (Again, Torch wants the target
-            # word wrapped in a tensor)
-            loss = model(center_batch, target_batch, negative_batch)
+        center_batch, target_batch, negative_batch = next(batch_gen)
 
-            # Step 5. Do the backward pass and update the gradient
-            loss.backward()
-            optimizer.step()
+        # Step 2. Recall that torch *accumulates* gradients. Before passing in a
+        # new instance, you need to zero out the gradients from the old
+        # instance
+        model.zero_grad()
 
-            # Get the Python number from a 1-element Tensor by calling tensor.item()
-            total_loss += loss.item()
-            losses.append(loss.item())
+        loss = model(center_batch, target_batch, negative_batch)
 
-            if i_batch % 100 == 0:
-                print("batch", i_batch, "loss=", sum(losses[-100:]) / 100)
-                losses = []
-            # if i_batch % 1000 == 0:
-            #     torch.save(model.state_dict(), "weights.pth")
-            # print("\tbatch_loss=", loss.item())
-        # print(losses)  # The loss decreased every iteration over the training data!
+        # Step 5. Do the backward pass and update the gradient
+        loss.backward()
+        optimizer.step()
 
-if __name__=="__main__":
+        losses.append(loss.item())
+
+        logger.scalar_summary('loss', losses[-1], i_batch)
+
+        if i_batch % PRINT_LOSS_EACH == 0:
+            print("batch", i_batch, f"loss= {sum(losses[-PRINT_LOSS_EACH:]) / PRINT_LOSS_EACH:.5}")
+
+        if i_batch % SAVE_WEIGHTS_EACH == 0:
+            torch.save(model.state_dict(), WEIGHTS_PATH)
+
+
+def _main():
+    logger = Logger('./logs')
+    train(logger)
+
+
+if __name__ == "__main__":
     _main()
